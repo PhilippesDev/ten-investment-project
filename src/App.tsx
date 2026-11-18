@@ -2229,15 +2229,15 @@ export default function App() {
                       <div className="w-16 h-16 bg-emerald-100 border border-emerald-300 rounded-full flex items-center justify-center mx-auto text-emerald-600 shadow-xs">
                         <CheckCircle2 className="w-10 h-10" />
                       </div>
-                      <h4 className="text-xl font-bold text-emerald-800">Simulation de recharge terminée</h4>
-                      <p className="text-xs text-slate-600 max-w-md mx-auto">Aucun paiement réel n’a été effectué. Cette simulation modifie uniquement les données locales de démonstration.</p>
+                      <h4 className="text-xl font-bold text-emerald-800">Recharge Mobile Money Validée !</h4>
+                      <p className="text-xs text-slate-600 max-w-md mx-auto">Votre paiement Mobile Money via MaishaPay a été confirmé avec succès. Votre solde a été crédité en direct et votre compte est pleinement activé.</p>
 
                       <div className="p-4 bg-white rounded-2xl border border-emerald-200 font-mono text-xs space-y-1 text-left max-w-md mx-auto shadow-xs">
-                        <span className="text-slate-400 block text-[10px]">RÉFÉRENCE DE SIMULATION :</span>
+                        <span className="text-slate-400 block text-[10px]">RÉFÉRENCE TRANSACTION MAISHAPAY :</span>
                         <div className="text-blue-600 font-bold truncate">{depositHash}</div>
                         <div className="text-slate-700">Montant crédité : {depositAmount.toLocaleString('fr-FR')} FC</div>
                         <div className="text-slate-700">Numéro débité : {depositPhone} ({depositOperator})</div>
-                        <div className="text-emerald-600 font-bold">Statut : SIMULATION</div>
+                        <div className="text-emerald-600 font-bold">Statut : PAYÉ & CONFIRMÉ EN TEMPS RÉEL</div>
                       </div>
 
                       <button 

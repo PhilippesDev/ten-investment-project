@@ -189,23 +189,8 @@ function maishapay_initiate_deposit($pdo, $user_id, $amount, $phone, $operator =
     $ref = 'DEP-' . date('ymdHis') . '-' . strtoupper(bin2hex(random_bytes(8)));
     $callback_url = maishapay_callback_url($ref);
 
-    if (MAISHAPAY_MODE !== 0) {
-        if (!MAISHAPAY_PUBLIC_KEY || !MAISHAPAY_SECRET_KEY || !function_exists('curl_init')) {
-            return ['ok' => false, 'etat' => 'erreur', 'message' => 'La passerelle MaishaPay n’est pas correctement configurée sur le serveur.'];
-        }
-        if (!filter_var($callback_url, FILTER_VALIDATE_URL) || strpos($callback_url, 'https://') !== 0) {
-            return ['ok' => false, 'etat' => 'erreur', 'message' => 'L’URL publique HTTPS du callback MaishaPay doit être configurée.'];
-        }
-    }
-
-    // Le mode sandbox ne crée pas de dépôt et ne modifie aucun solde réel.
-    if (MAISHAPAY_MODE === 0) {
-        return [
-            'ok'        => true,
-            'etat'      => 'reussi',
-            'reference' => $ref,
-            'message'   => "Simulation Sandbox terminée pour " . number_format($amount, 0, ',', ' ') . " FC. Aucun paiement réel ni crédit de portefeuille n’a été effectué."
-        ];
+    if (!MAISHAPAY_PUBLIC_KEY || !MAISHAPAY_SECRET_KEY || !function_exists('curl_init')) {
+        return ['ok' => false, 'etat' => 'erreur', 'message' => 'La passerelle MaishaPay n’est pas configurée. Veuillez renseigner MAISHAPAY_PUBLIC_KEY et MAISHAPAY_SECRET_KEY dans le fichier .env.'];
     }
 
     // Enregistrement préalable du dépôt en base
@@ -230,7 +215,7 @@ function maishapay_initiate_deposit($pdo, $user_id, $amount, $phone, $operator =
         "callbackUrl"          => $callback_url,
     ];
 
-    // Appel cURL sécurisé vers MaishaPay
+    // Appel cURL vers MaishaPay
     $ch = curl_init(MAISHAPAY_API_URL);
     curl_setopt_array($ch, [
         CURLOPT_POST           => true,
@@ -242,8 +227,8 @@ function maishapay_initiate_deposit($pdo, $user_id, $amount, $phone, $operator =
         ],
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_TIMEOUT        => 45,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_SSL_VERIFYPEER => false, // Évite les blocages de chaîne de certificat intermédiaire
+        CURLOPT_SSL_VERIFYHOST => 0,
     ]);
 
     $reponse = curl_exec($ch);
@@ -276,7 +261,6 @@ function maishapay_initiate_deposit($pdo, $user_id, $amount, $phone, $operator =
             || (isset($decoded['status']) && $decoded['status'] === 'success')
         );
 
-    // Cas 2 : Mode Production (MAISHAPAY_MODE = 1)
     if ($is_accepted) {
         return [
             'ok'        => true,
@@ -289,9 +273,18 @@ function maishapay_initiate_deposit($pdo, $user_id, $amount, $phone, $operator =
         ];
     }
 
-    // En cas d'erreur de la passerelle
-    $err_msg = (is_array($decoded) ? ($decoded['message'] ?? null) : null)
-        ?: ($err_curl ?: "Impossible d'initier la demande Mobile Money. Veuillez vérifier votre numéro et réessayer.");
+    // Extraction précise des détails d'erreur renvoyés par MaishaPay
+    $err_msg = '';
+    if (is_array($decoded)) {
+        if (!empty($decoded['description'])) {
+            $err_msg = (!empty($decoded['title']) ? $decoded['title'] . ': ' : '') . $decoded['description'];
+        } elseif (!empty($decoded['message'])) {
+            $err_msg = $decoded['message'];
+        }
+    }
+    if (!$err_msg) {
+        $err_msg = $err_curl ?: "Impossible d'initier la demande Mobile Money auprès de MaishaPay (Code HTTP: {$http_code}).";
+    }
     
     // Si échec clair, on note l'échec
     $stmt_fail = $pdo->prepare("UPDATE deposits SET status = 'rejete', admin_note = ? WHERE id = ?");

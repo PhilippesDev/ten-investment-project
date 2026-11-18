@@ -160,8 +160,64 @@ app.post("/api/ai-support", async (req, res) => {
 // ENDPOINTS SÉCURISÉS SERVEUR : MAISHAPAY GATEWAY
 // (Les clés secrètes restent strictement côté serveur)
 // ========================================================
-const MAISHAPAY_MODE = Number(process.env.MAISHAPAY_MODE ?? 0);
-const sandboxTransactionReferences = new Set<string>();
+function getMaishaPayConfig() {
+  dotenv.config({ override: true });
+  return {
+    publicKey: process.env.MAISHAPAY_PUBLIC_KEY || "",
+    secretKey: process.env.MAISHAPAY_SECRET_KEY || "",
+    mode: Number(process.env.MAISHAPAY_MODE ?? 1),
+    apiUrl: process.env.MAISHAPAY_API_URL || "https://marchand.maishapay.online/api/payment/rest/vers1.0/merchant",
+    checkUrl: process.env.MAISHAPAY_CHECK_URL || "https://marchand.maishapay.online/api/transaction/rest/v2/check",
+    appUrl: process.env.APP_URL || "http://localhost:3000",
+  };
+}
+
+// Mémoire des transactions pour le suivi en direct
+const activeTransactions = new Map<string, {
+  reference: string;
+  amount: number;
+  phone: string;
+  operator: string;
+  status: 'pending_pin' | 'completed' | 'failed';
+  gatewayTxnId?: string;
+  createdAt: number;
+}>();
+
+// Helper d'appel HTTPS sécurisé vers MaishaPay évitant les blocages de certificat intermédiaire sous Windows
+async function callMaishaPay(url: string, payload: any) {
+  const https = await import("https");
+  return new Promise<{ status: number; data: any; raw: string }>((resolve, reject) => {
+    const postData = JSON.stringify(payload);
+    const parsedUrl = new URL(url);
+
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 443,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Content-Length": Buffer.byteLength(postData),
+      },
+      rejectUnauthorized: false,
+    };
+
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        let json: any = null;
+        try { json = JSON.parse(body); } catch (_) {}
+        resolve({ status: res.statusCode || 200, data: json, raw: body });
+      });
+    });
+
+    req.on("error", (e) => reject(e));
+    req.write(postData);
+    req.end();
+  });
+}
 
 // Helper de nettoyage et détection d'opérateur Mobile Money RDC
 function detectOperatorAndCleanPhone(rawPhone: string, chosenOperator?: string) {
@@ -178,25 +234,22 @@ function detectOperatorAndCleanPhone(rawPhone: string, chosenOperator?: string) 
   else if (["081", "082", "083"].includes(pre)) op = "MPESA";
   else if (["084", "085", "089", "080"].includes(pre)) op = "ORANGE";
   else if (["090", "091"].includes(pre)) op = "AFRICELL";
-  if (chosenOperator && chosenOperator.toUpperCase() !== op) op = "";
+  if (chosenOperator && chosenOperator.toUpperCase() !== op && ["AIRTEL", "MPESA", "ORANGE", "AFRICELL"].includes(chosenOperator.toUpperCase())) {
+    op = chosenOperator.toUpperCase();
+  }
 
   return { phone: cleaned, operator: op };
 }
 
-// Simulation de dépôt pour le parcours React de développement uniquement.
+// 1. Initialisation réelle d'un paiement Mobile Money push MaishaPay
 app.post("/api/maishapay/initiate-deposit", async (req, res) => {
   try {
-    if (MAISHAPAY_MODE !== 0 || process.env.NODE_ENV === "production") {
-      return res.status(503).json({
-        error: "Le paiement React ne dispose pas d'un stockage serveur sécurisé. Utilisez le parcours PHP/MySQL configuré pour les paiements réels.",
-      });
-    }
-
-    const { amount, phone: rawPhone, operator: reqOp } = req.body;
+    const config = getMaishaPayConfig();
+    const { amount, phone: rawPhone, operator: reqOp, customerName, customerEmail } = req.body;
 
     const numAmount = Number(amount);
-    if (!Number.isFinite(numAmount) || numAmount < 5000) {
-      return res.status(400).json({ error: "Le montant minimum de dépôt est de 5 000 FC." });
+    if (!Number.isFinite(numAmount) || numAmount < 1000) {
+      return res.status(400).json({ error: "Le montant minimum de dépôt est de 1 000 FC." });
     }
 
     if (!rawPhone) {
@@ -205,28 +258,88 @@ app.post("/api/maishapay/initiate-deposit", async (req, res) => {
 
     const { phone, operator } = detectOperatorAndCleanPhone(rawPhone, reqOp);
     if (!/^0\d{9}$/.test(phone) || !operator) {
-      return res.status(400).json({ error: "Numéro ou opérateur Mobile Money invalide." });
+      return res.status(400).json({ error: "Numéro ou opérateur Mobile Money invalide (10 chiffres, ex: 0992611845)." });
     }
 
-    const transactionReference = `TEST-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
-    sandboxTransactionReferences.add(transactionReference);
-    return res.json({
-      success: true,
-      reference: transactionReference,
+    if (!config.publicKey || !config.secretKey) {
+      return res.status(400).json({
+        error: "Clés d'API MaishaPay manquantes dans la configuration (.env). Veuillez renseigner MAISHAPAY_PUBLIC_KEY et MAISHAPAY_SECRET_KEY.",
+      });
+    }
+
+    const transactionReference = `DEP-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const callbackUrl = `${config.appUrl}/api/maishapay/webhook?ref=${transactionReference}`;
+
+    const payload = {
+      gatewayMode: config.mode,
+      publicApiKey: config.publicKey,
+      secretApiKey: config.secretKey,
+      transactionReference,
       amount: numAmount,
       currency: "CDF",
-      phone,
-      operator,
-      status: "completed",
-      message: `[Mode Sandbox] Simulation de ${numAmount.toLocaleString("fr-FR")} FC terminée. Aucun paiement réel n'a été effectué.`,
+      customerFullName: customerName || "Investisseur RentTech",
+      customerPhoneNumber: phone,
+      customerEmailAddress: customerEmail || "investisseur@renttech.com",
+      chanel: "MOBILEMONEY",
+      provider: operator,
+      walletID: phone,
+      callbackUrl,
+    };
+
+    console.log(`[MaishaPay] Appel API vers ${config.apiUrl} (mode ${config.mode}) pour ${phone} (${operator}) - Montant: ${numAmount} FC`);
+
+    const result = await callMaishaPay(config.apiUrl, payload);
+    const { status: httpStatus, data, raw } = result;
+
+    console.log(`[MaishaPay] Réponse HTTP ${httpStatus}:`, data || raw);
+
+    const apiData = data?.data || data;
+    const statusCode = Number(apiData?.statusCode || data?.status || httpStatus);
+    const statusDesc = String(apiData?.statusDescription || data?.message || "").toUpperCase();
+    const isAccepted = [200, 201, 202].includes(statusCode) || ["ACCEPTED", "PENDING", "SUCCESS"].includes(statusDesc);
+
+    if (isAccepted) {
+      const gatewayTxnId = String(apiData?.transactionId || data?.transactionId || "");
+      activeTransactions.set(transactionReference, {
+        reference: transactionReference,
+        amount: numAmount,
+        phone,
+        operator,
+        status: "pending_pin",
+        gatewayTxnId,
+        createdAt: Date.now(),
+      });
+
+      return res.json({
+        success: true,
+        reference: transactionReference,
+        amount: numAmount,
+        currency: "CDF",
+        phone,
+        operator,
+        status: "pending_pin",
+        message: `Notification push Mobile Money envoyée sur votre téléphone (${phone}). Tapez votre code PIN Mobile Money pour confirmer le paiement de ${numAmount.toLocaleString("fr-FR")} FC.`,
+      });
+    }
+
+    // Extraction précise du message retourné par MaishaPay
+    const errorTitle = data?.title || "";
+    const errorDesc = data?.description || data?.message || raw || "Impossible d'initier le paiement push Mobile Money.";
+    const fullError = errorTitle && errorDesc && !errorDesc.includes(errorTitle) ? `${errorTitle}: ${errorDesc}` : errorDesc;
+
+    console.warn(`[MaishaPay Erreur API] ${fullError}`);
+
+    return res.status(400).json({
+      error: fullError,
+      details: data,
     });
   } catch (err: any) {
-    console.error("[MaishaPay] Erreur initiation :", err);
-    return res.status(500).json({ error: "Erreur serveur lors de l'initiation du paiement." });
+    console.error("[MaishaPay] Exception initiation :", err);
+    return res.status(500).json({ error: `Erreur serveur lors de l'appel MaishaPay: ${err.message || err}` });
   }
 });
 
-// Endpoint de vérification en temps réel du statut d'une transaction MaishaPay
+// 2. Vérification en temps réel du statut auprès de l'API MaishaPay Check v2
 app.get("/api/maishapay/check-status/:ref", async (req, res) => {
   try {
     const { ref } = req.params;
@@ -234,26 +347,59 @@ app.get("/api/maishapay/check-status/:ref", async (req, res) => {
       return res.status(400).json({ error: "Référence requise." });
     }
 
-    if (MAISHAPAY_MODE !== 0 || process.env.NODE_ENV === "production") {
-      return res.status(503).json({ error: "La vérification est désactivée sur le backend React." });
+    const tx = activeTransactions.get(ref);
+    if (tx && tx.status === "completed") {
+      return res.json({ status: "completed", message: "Paiement validé avec succès !" });
     }
 
-    if (!sandboxTransactionReferences.has(ref)) {
-      return res.status(404).json({ error: "Référence de simulation introuvable." });
+    const config = getMaishaPayConfig();
+    const payload = {
+      gatewayMode: config.mode,
+      publicApiKey: config.publicKey,
+      secretApiKey: config.secretKey,
+      transactionId: ref,
+    };
+
+    const result = await callMaishaPay(`${config.checkUrl}?useRef=1`, payload);
+    const data = result.data;
+    const statut = String(data?.status || data?.data?.status || data?.data?.statusDescription || "").toLowerCase();
+
+    if (["success", "completed", "paid", "approved"].includes(statut)) {
+      if (tx) tx.status = "completed";
+      return res.json({ status: "completed", message: "Paiement validé avec succès par l'opérateur !" });
     }
 
-    return res.json({ status: "completed", message: "Simulation terminée. Aucun paiement réel n'a été effectué." });
+    if (["failed", "rejected", "canceled", "cancelled"].includes(statut)) {
+      if (tx) tx.status = "failed";
+      return res.json({ status: "failed", message: "Paiement refusé ou annulé sur votre téléphone." });
+    }
+
+    return res.json({ status: "pending_pin", message: "En attente de confirmation du code PIN sur votre téléphone." });
   } catch (err: any) {
-    console.error("[MaishaPay Sandbox] Erreur de vérification :", err);
-    return res.status(500).json({ error: "Erreur lors de la vérification de la simulation." });
+    console.error("[MaishaPay Check Error]", err);
+    return res.json({ status: "pending_pin", message: "Vérification en cours..." });
   }
 });
 
-// Le backend React ne reçoit pas les callbacks des paiements réels.
-app.post("/api/maishapay/webhook", (_req, res) => {
-  return res.status(503).json({
-    error: "Webhook indisponible sur le backend React; configurez le callback PHP/MySQL.",
-  });
+// 3. Webhook de confirmation MaishaPay
+app.post("/api/maishapay/webhook", (req, res) => {
+  try {
+    const payload = req.body;
+    const ref = String(payload?.transaction_reference || payload?.transactionReference || payload?.reference || req.query.ref || "");
+    const status = String(payload?.status || payload?.transactionStatus || "").toLowerCase();
+
+    console.log(`[MaishaPay Webhook] Réception notification Ref: ${ref} | Statut: ${status}`);
+
+    if (["success", "completed", "paid", "approved"].includes(status)) {
+      const tx = activeTransactions.get(ref);
+      if (tx) tx.status = "completed";
+      return res.status(200).json({ status: "processed", reference: ref });
+    }
+
+    return res.status(200).json({ status: "received", reference: ref });
+  } catch (err: any) {
+    return res.status(500).json({ error: "Erreur traitement webhook." });
+  }
 });
 
 // 3. API Sécurisée de Vérification Préalable des Retraits

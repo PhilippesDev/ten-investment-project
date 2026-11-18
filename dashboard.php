@@ -619,12 +619,12 @@ $levels = get_investment_levels();
                     return;
                 }
 
-                // Cas 1 : Succès immédiat (ex: mode Sandbox / Test)
+                // Cas 1 : Succès immédiat
                 if (data.etat === 'reussi') {
                     statusBox.className = 'p-3 mb-3 rounded-3 border border-success bg-dark';
                     spinner.style.display = 'none';
                     statusTitle.className = 'fw-bold mb-1 text-success';
-                    statusTitle.textContent = "Simulation terminée (aucun paiement réel)";
+                    statusTitle.textContent = "✅ Paiement Confirmé & Solde Crédité !";
                     statusDesc.textContent = data.message;
                     setTimeout(() => { window.location.reload(); }, 2000);
                     return;
